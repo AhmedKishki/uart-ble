@@ -31,6 +31,9 @@ static atomic_t b_cache;      /* 4 bytes for B (packed as u32) */ // Atomic stor
 #define FLAG_B_READY BIT(1)   // Bit mask for "B data ready"
 static atomic_t ready_flags;  // Atomic bitfield of which payloads are ready
 
+/* Soft half-duplex: when 1, RX bytes are ignored (self-echo mute) */
+static atomic_t tx_active;
+
 /* Producers call these to update cache + set flag */
 static inline void set_a(const uint8_t v[4]) {               // Producer helper: publish A bytes + mark ready
     four_bytes_t t = { .b = { v[0], v[1], v[2], v[3] } };    // Pack 4 bytes into a u32
@@ -42,6 +45,9 @@ static inline void set_b(const uint8_t v[4]) {               // Producer helper:
     atomic_set(&b_cache, (atomic_val_t)t.u32);               // Atomically store new B payload
     atomic_or(&ready_flags, FLAG_B_READY);                   // Atomically set B-ready flag
 }
+
+/* ---------- RX byte queue (ISR -> parser) ---------- */
+K_MSGQ_DEFINE(rx_q, sizeof(uint8_t), 64, 4);  /* room for bursts of bytes */
 
 /* ---------- Worker-thread signaling ---------- */
 K_MSGQ_DEFINE(cmd_q, sizeof(uint8_t), 8, 4);   /* RX ISR → worker */ // Queue of 1-byte commands from ISR to worker
@@ -69,8 +75,12 @@ static void uart_cb(const struct device *dev, struct uart_event *evt, void *ud) 
         const uint8_t *p = evt->data.rx.buf + evt->data.rx.offset; // Pointer to received bytes within buffer
         size_t n = evt->data.rx.len;                             // Number of new bytes in this slice
         for (size_t i = 0; i < n; i++) {                         // Iterate each received byte
+			if (atomic_get(&tx_active)) {
+            	LOG_INF("Soft-mute active: drop self-echo / any bytes during our TX");
+            	continue;
+        	}
             uint8_t c = p[i];                                    // Current byte
-            (void)k_msgq_put(&cmd_q, &c, K_NO_WAIT);             // Enqueue command for worker (drops if full)
+            (void)k_msgq_put(&rx_q, &c, K_NO_WAIT);             // Enqueue command for worker (drops if full)
         }
         break;                                                   // Done with this RX_RDY slice
     }
@@ -82,6 +92,34 @@ static void uart_cb(const struct device *dev, struct uart_event *evt, void *ud) 
         break;                                                   // Return from ISR
     default:                                                     // Other events not used here
         break;                                                   // Ignore to keep ISR minimal
+    }
+}
+
+/* ---------- Parser thread: turns byte stream into commands ---------- */
+void parser_worker(void *p1, void *p2, void *p3)
+{
+    ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
+
+    enum { WAIT_S, GOT_S } state = WAIT_S;
+    uint8_t ch;
+
+    for (;;) {
+        k_msgq_get(&rx_q, &ch, K_FOREVER);
+
+        switch (state) {
+        case WAIT_S:
+            if (ch == 'S') { state = GOT_S; }
+            break;
+
+        case GOT_S:
+            if (ch == 'A' || ch == 'B') {
+                /* forward the command to the TX worker */
+                (void)k_msgq_put(&cmd_q, &ch, K_NO_WAIT);
+            }
+            /* regardless of what the second byte was, reset */
+            state = WAIT_S;
+            break;
+        }
     }
 }
 
@@ -111,6 +149,11 @@ void tx_worker(void *a, void *b, void *c) // Worker thread that serializes TX an
             continue;                                                  // Ignore and wait for the next
         }
 
+		/* --- Begin soft half-duplex window --- */
+		atomic_set(&tx_active, 1);
+		/* Drop any bytes that slipped in just before we set the flag */
+		k_msgq_purge(&rx_q);
+
         /* Start TX (non-blocking call), retry if UART currently busy */
         int rc;                                                        // Return code from uart_tx()
         do {
@@ -133,6 +176,8 @@ void tx_worker(void *a, void *b, void *c) // Worker thread that serializes TX an
             }
         }
         /* else: error starting TX → silently drop (keeps code minimal) */ // If rc != 0 and != -EBUSY, drop it
+		/* --- End soft half-duplex window --- */
+		atomic_clear(&tx_active);
     }
 }
 
@@ -152,6 +197,7 @@ void producer_a(void *p1, void *p2, void *p3) // Example A-producer: continually
         k_sleep(K_MSEC(10));                         // Sleep a bit before next publish
     }
 }
+
 void producer_b(void *p1, void *p2, void *p3) // Example B-producer: continually publishes 'B' bytes
 {
     ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3); // Unused args
@@ -169,10 +215,14 @@ void producer_b(void *p1, void *p2, void *p3) // Example B-producer: continually
 }
 
 /* ---------- Threads ---------- */
+K_THREAD_STACK_DEFINE(parser_stack, 1024);
 K_THREAD_STACK_DEFINE(worker_stack, 1024);          // Stack for worker thread (TX serializer)
 K_THREAD_STACK_DEFINE(prod_a_stack, 768);           // Stack for A-producer thread
 K_THREAD_STACK_DEFINE(prod_b_stack, 768);           // Stack for B-producer thread
-static struct k_thread worker_tcb, prod_a_tcb, prod_b_tcb; // Thread control blocks (metadata)
+static struct k_thread parser_tcb;
+static struct k_thread worker_tcb;
+static struct k_thread prod_a_tcb;
+static struct k_thread prod_b_tcb; // Thread control blocks (metadata)
 
 /* ---------- Main ---------- */
 int main(void) // Entry point (Zephyr apps still define main())
@@ -184,6 +234,7 @@ int main(void) // Entry point (Zephyr apps still define main())
 
     /* Init flags/caches + sem */
     atomic_clear(&ready_flags);                     // Clear all ready flags at startup
+	atomic_clear(&tx_active);
     atomic_set(&a_cache, 0);                        // Initialize A cache to 0
     atomic_set(&b_cache, 0);                        // Initialize B cache to 0
     k_sem_init(&tx_done_sem, 0, 1);                 // Initialize TX completion semaphore (count=0, max=1)
@@ -201,17 +252,23 @@ int main(void) // Entry point (Zephyr apps still define main())
     }
 
     /* Start worker + producers */
+	k_thread_create(&parser_tcb, parser_stack, K_THREAD_STACK_SIZEOF(parser_stack),
+                	parser_worker, NULL, NULL, NULL,
+                	K_PRIO_PREEMPT(7), 0, K_NO_WAIT); // Start parser thread (higher prio than producers)
+
     k_thread_create(&worker_tcb, worker_stack, K_THREAD_STACK_SIZEOF(worker_stack),
                     tx_worker, NULL, NULL, NULL,
                     K_PRIO_PREEMPT(7), 0, K_NO_WAIT); // Start worker thread (higher prio than producers)
+
     k_thread_create(&prod_a_tcb, prod_a_stack, K_THREAD_STACK_SIZEOF(prod_a_stack),
                     producer_a, NULL, NULL, NULL,
                     K_PRIO_PREEMPT(8), 0, K_NO_WAIT); // Start A-producer thread
+
     k_thread_create(&prod_b_tcb, prod_b_stack, K_THREAD_STACK_SIZEOF(prod_b_stack),
                     producer_b, NULL, NULL, NULL,
                     K_PRIO_PREEMPT(8), 0, K_NO_WAIT); // Start B-producer thread
 
-    LOG_INF("Worker-thread TX: send 'A' or 'B' to get 4 bytes (flag-gated)."); // Informative startup log
+    LOG_INF("Worker-thread TX: send 'S' followed b 'A' or 'B' or 'C'."); // Informative startup log
 
     while (1) {                                   // Keep main thread alive
         k_sleep(K_FOREVER);                       // Park forever (all work is in other threads/ISR)
