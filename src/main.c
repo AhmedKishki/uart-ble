@@ -1,135 +1,219 @@
 /*
- * Copyright (c) 2025 Embeint Inc
- *
  * SPDX-License-Identifier: Apache-2.0
- */
+ */ // License header: project uses Apache-2.0
+#include <zephyr/kernel.h>            // Core kernel APIs: threads, semaphores, msgq, sleep
+#include <zephyr/device.h>            // Device model (DEVICE_DT_GET, device_is_ready)
+#include <zephyr/drivers/uart.h>      // UART driver APIs (async callbacks, uart_tx/rx)
+#include <zephyr/logging/log.h>       // Logging subsystem (LOG_*)
+#include <zephyr/sys/atomic.h>        // Atomic operations (atomic_t, atomic_get/set/or/and)l
+#include <string.h>                   // memcpy()
 
-#include <zephyr/kernel.h>
-#include <zephyr/device.h>
-#include <zephyr/net_buf.h>
-#include <zephyr/logging/log.h>
-#include <zephyr/drivers/uart.h>
-#include <zephyr/random/random.h>
+LOG_MODULE_REGISTER(uart_ab_worker, LOG_LEVEL_INF); // Define a log module at INFO level
 
-/* change this to any other UART peripheral if desired */
-#define UART_DEVICE_NODE DT_CHOSEN(zephyr_shell_uart)
+/* UART & RX config */
+#define UART_NODE            DT_CHOSEN(zephyr_shell_uart) // Use the board's chosen shell/console UART
+#define RX_CHUNK_LEN         64                            // Size of each RX buffer chunk
+#define RX_IDLE_TIMEOUT_US   20000  /* 20 ms */            // RX idle timeout to deliver UART_RX_RDY slices
 
-/* Maximum number of packets to generate per iteration */
-#define LOOP_ITER_MAX_TX 4
-/* Maximum size of our TX packets */
-#define MAX_TX_LEN 32
-#define RX_CHUNK_LEN 32
+/* Commands */
+#define CMD_A 'A'            // ASCII 'A' will trigger sending A's payload
+#define CMD_B 'B'            // ASCII 'B' will trigger sending B's payload
 
-/* Buffer pool for our TX payloads */
-NET_BUF_POOL_DEFINE(tx_pool, LOOP_ITER_MAX_TX, MAX_TX_LEN, 0, NULL);
+static const struct device *const uart_dev = DEVICE_DT_GET(UART_NODE); // Get the UART device at build time
 
-struct k_fifo tx_queue;
-struct net_buf *tx_pending_buffer;
-uint8_t async_rx_buffer[2][RX_CHUNK_LEN];
-volatile uint8_t async_rx_buffer_idx;
+/* ---------- Shared 4-byte caches + ready flags (lock-free) ---------- */
+typedef union { uint8_t b[4]; uint32_t u32; } four_bytes_t; // Helper to pack/unpack 4 bytes atomically
 
-static const struct device *const uart_dev = DEVICE_DT_GET(UART_DEVICE_NODE);
+static atomic_t a_cache;      /* 4 bytes for A (packed as u32) */ // Atomic storage for latest A payload
+static atomic_t b_cache;      /* 4 bytes for B (packed as u32) */ // Atomic storage for latest B payload
 
-LOG_MODULE_REGISTER(sample, LOG_LEVEL_INF);
+#define FLAG_A_READY BIT(0)   // Bit mask for "A data ready"
+#define FLAG_B_READY BIT(1)   // Bit mask for "B data ready"
+static atomic_t ready_flags;  // Atomic bitfield of which payloads are ready
 
-static void uart_callback(const struct device *dev, struct uart_event *evt, void *user_data)
-{
-	struct net_buf *buf;
-	int rc;
-
-	LOG_DBG("EVENT: %d", evt->type);
-
-	switch (evt->type) {
-	case UART_TX_DONE:
-		LOG_DBG("TX complete %p", tx_pending_buffer);
-
-		/* Free TX buffer */
-		net_buf_unref(tx_pending_buffer);
-		tx_pending_buffer = NULL;
-
-		/* Handle any queued buffers */
-		buf = k_fifo_get(&tx_queue, K_NO_WAIT);
-		if (buf != NULL) {
-			rc = uart_tx(dev, buf->data, buf->len, 0);
-			if (rc != 0) {
-				LOG_ERR("TX from ISR failed (%d)", rc);
-				net_buf_unref(buf);
-			} else {
-				tx_pending_buffer = buf;
-			}
-		}
-		break;
-	case UART_RX_BUF_REQUEST:
-		/* Return the next buffer index */
-		LOG_DBG("Providing buffer index %d", async_rx_buffer_idx);
-		rc = uart_rx_buf_rsp(dev, async_rx_buffer[async_rx_buffer_idx],
-				     sizeof(async_rx_buffer[0]));
-		__ASSERT_NO_MSG(rc == 0);
-		async_rx_buffer_idx = async_rx_buffer_idx ? 0 : 1;
-		break;
-	case UART_RX_BUF_RELEASED:
-	case UART_RX_DISABLED:
-		break;
-	case UART_RX_RDY:
-		LOG_HEXDUMP_INF(evt->data.rx.buf + evt->data.rx.offset,
-				evt->data.rx.len, "RX_RDY");
-		break;
-	default:
-		LOG_WRN("Unhandled event %d", evt->type);
-	}
+/* Producers call these to update cache + set flag */
+static inline void set_a(const uint8_t v[4]) {               // Producer helper: publish A bytes + mark ready
+    four_bytes_t t = { .b = { v[0], v[1], v[2], v[3] } };    // Pack 4 bytes into a u32
+    atomic_set(&a_cache, (atomic_val_t)t.u32);               // Atomically store new A payload
+    atomic_or(&ready_flags, FLAG_A_READY);                   // Atomically set A-ready flag
+}
+static inline void set_b(const uint8_t v[4]) {               // Producer helper: publish B bytes + mark ready
+    four_bytes_t t = { .b = { v[0], v[1], v[2], v[3] } };    // Pack 4 bytes into a u32
+    atomic_set(&b_cache, (atomic_val_t)t.u32);               // Atomically store new B payload
+    atomic_or(&ready_flags, FLAG_B_READY);                   // Atomically set B-ready flag
 }
 
-int main(void)
+/* ---------- Worker-thread signaling ---------- */
+K_MSGQ_DEFINE(cmd_q, sizeof(uint8_t), 8, 4);   /* RX ISR → worker */ // Queue of 1-byte commands from ISR to worker
+static struct k_sem tx_done_sem;               /* ISR gives on TX_DONE */ // Semaphore signaled when TX finishes
+
+/* ---------- RX double buffering ---------- */
+static uint8_t rx_buf[2][RX_CHUNK_LEN];  // Two ping-pong RX buffers for zero-copy async receiving
+static volatile uint8_t rx_idx;          // Index of the next buffer to hand to the driver (toggled in ISR)
+
+/* ---------- UART async callback (ISR context) ---------- */
+static void uart_cb(const struct device *dev, struct uart_event *evt, void *ud) // ISR callback for UART events
 {
-	bool rx_enabled = false;
-	struct net_buf *tx_buf;
-	int loop_counter = 0;
-	uint8_t num_tx;
-	int tx_len;
-	int rc;
+    ARG_UNUSED(ud); // We don't use the user_data pointer
 
-	/* Register the async interrupt handler */
-	uart_callback_set(uart_dev, uart_callback, (void *)uart_dev);
+    switch (evt->type) { // Handle the specific UART event type
+    case UART_RX_BUF_REQUEST: {                                  // Driver asks for the next RX buffer
+        uint8_t i = rx_idx;                                      // Snapshot which buffer index to hand over
+        int rc = uart_rx_buf_rsp(dev, rx_buf[i], sizeof(rx_buf[0])); // Provide buffer i to keep RX continuous
+        if (rc == 0) {                                           // If handoff succeeded
+        	rx_idx = i ^ 1;                                      // Toggle 0↔1 so the other buffer is next
+    	}
+        break;                                                   // Done handling buffer request
+    }
+    case UART_RX_RDY: {                                          // RX data slice is ready (idle timeout or fill)
+        const uint8_t *p = evt->data.rx.buf + evt->data.rx.offset; // Pointer to received bytes within buffer
+        size_t n = evt->data.rx.len;                             // Number of new bytes in this slice
+        for (size_t i = 0; i < n; i++) {                         // Iterate each received byte
+            uint8_t c = p[i];                                    // Current byte
+            (void)k_msgq_put(&cmd_q, &c, K_NO_WAIT);             // Enqueue command for worker (drops if full)
+        }
+        break;                                                   // Done with this RX_RDY slice
+    }
+    case UART_TX_DONE:                                           // TX finished sending the last buffer
+        k_sem_give(&tx_done_sem);                                // Wake the worker waiting for completion
+        break;                                                   // Return from ISR
+    case UART_TX_ABORTED:                                        // TX aborted (error/cancel)
+        k_sem_give(&tx_done_sem);                                // Also wake the worker so it can recover
+        break;                                                   // Return from ISR
+    default:                                                     // Other events not used here
+        break;                                                   // Ignore to keep ISR minimal
+    }
+}
 
-	while (1) {
-		/* Wait a while until the next burst transmission */
-		k_sleep(K_SECONDS(5));
+/* ---------- Worker thread: does TX (not ISR) ---------- */
+void tx_worker(void *a, void *b, void *c) // Worker thread that serializes TX and clears flags after send
+{
+    ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c); // Unused thread args
 
-		/* Each loop, try to send a random number of packets */
-		num_tx = (sys_rand32_get() % LOOP_ITER_MAX_TX) + 1;
-		LOG_INF("Loop %d: Sending %d packets", loop_counter, num_tx);
-		for (int i = 0; i < num_tx; i++) {
-			/* Allocate the data packet */
-			tx_buf = net_buf_alloc(&tx_pool, K_FOREVER);
-			/* Populate it with data */
-			tx_len = snprintk(tx_buf->data, net_buf_tailroom(tx_buf),
-					  "Loop %d: Packet: %d\r\n", loop_counter, i);
-			net_buf_add(tx_buf, tx_len);
+    uint8_t cmd;                   // Command byte dequeued from cmd_q
+    uint8_t payload[4];            // Local buffer to hold 4-byte snapshot to send
 
-			/* Queue packet for transmission */
-			rc = uart_tx(uart_dev, tx_buf->data, tx_buf->len, SYS_FOREVER_US);
-			if (rc == 0) {
-				/* Store the pending buffer */
-				tx_pending_buffer = tx_buf;
-			} else if (rc == -EBUSY) {
-				/* Transmission is already in progress */
-				LOG_DBG("Queuing buffer %p", tx_buf);
-				k_fifo_put(&tx_queue, tx_buf);
-			} else {
-				LOG_ERR("Unknown error (%d)", rc);
-			}
-		}
+    for (;;) {                                                         // Run forever
+        /* Wait for a command from RX ISR */
+        k_msgq_get(&cmd_q, &cmd, K_FOREVER);                           // Block until a command arrives
 
-		/* Toggle the RX state */
-		if (rx_enabled) {
-			uart_rx_disable(uart_dev);
-		} else {
-			async_rx_buffer_idx = 1;
-			uart_rx_enable(uart_dev, async_rx_buffer[0], RX_CHUNK_LEN, 100);
-		}
-		rx_enabled = !rx_enabled;
-		LOG_INF("RX is now %s", rx_enabled ? "enabled" : "disabled");
+        /* Check if producer flagged data as ready */
+        uint32_t flags = (uint32_t)atomic_get(&ready_flags);           // Snapshot ready flags atomically
+        if (cmd == CMD_A) {                                            // If 'A' command
+            if (!(flags & FLAG_A_READY)) continue;                     // Skip if no new A data is ready
+            four_bytes_t t; t.u32 = (uint32_t)atomic_get(&a_cache);    // Atomically read latest A payload
+            memcpy(payload, t.b, 4);                                   // Copy into local TX buffer
+        } else if (cmd == CMD_B) {                                     // If 'B' command
+            if (!(flags & FLAG_B_READY)) continue;                     // Skip if no new B data is ready
+            four_bytes_t t; t.u32 = (uint32_t)atomic_get(&b_cache);    // Atomically read latest B payload
+            memcpy(payload, t.b, 4);                                   // Copy into local TX buffer
+        } else {                                                       // Unknown command
+            continue;                                                  // Ignore and wait for the next
+        }
 
-		loop_counter += 1;
-	}
+        /* Start TX (non-blocking call), retry if UART currently busy */
+        int rc;                                                        // Return code from uart_tx()
+        do {
+            rc = uart_tx(uart_dev, payload, sizeof(payload), 0);       // Try to start TX immediately (no timeout)
+            if (rc == -EBUSY) {                                        // If UART is currently sending something
+                /* Wait for previous TX to finish, then retry */
+                k_sem_take(&tx_done_sem, K_FOREVER);                   // Block until ISR signals TX done/aborted
+            }
+        } while (rc == -EBUSY);                                        // Loop until uart_tx() is accepted or fails
+
+        if (rc == 0) {                                                 // TX successfully started
+            /* Wait for TX completion to ensure payload lives long enough */
+            k_sem_take(&tx_done_sem, K_FOREVER);                       // Wait for UART_TX_DONE/ABORTED from ISR
+
+            /* After every send, unset the flag */
+            if (cmd == CMD_A) {                                        // We just sent A
+                atomic_and(&ready_flags, ~FLAG_A_READY);               // Clear A-ready flag (consumed)
+            } else {                                                   // We just sent B
+                atomic_and(&ready_flags, ~FLAG_B_READY);               // Clear B-ready flag (consumed)
+            }
+        }
+        /* else: error starting TX → silently drop (keeps code minimal) */ // If rc != 0 and != -EBUSY, drop it
+    }
+}
+
+/* ---------- Example producers (replace with your real ones) ---------- */
+void producer_a(void *p1, void *p2, void *p3) // Example A-producer: continually publishes 'A' bytes
+{
+    ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3); // Unused args
+
+    while (1) {                                      // Loop forever
+        uint8_t v[4] = {                             // 4-byte payload for A (here constant 'A' = 0x41)
+            (uint8_t)(0x41),
+            (uint8_t)(0x41),
+            (uint8_t)(0x41),
+            (uint8_t)(0x41),
+        };
+        set_a(v);                                    // Publish A payload + set A-ready flag
+        k_sleep(K_MSEC(10));                         // Sleep a bit before next publish
+    }
+}
+void producer_b(void *p1, void *p2, void *p3) // Example B-producer: continually publishes 'B' bytes
+{
+    ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3); // Unused args
+
+    while (1) {                                     // Loop forever
+        uint8_t v[4] = {                            // 4-byte payload for B (here constant 'B' = 0x42)
+            (uint8_t)(0x42),
+            (uint8_t)(0x42),
+            (uint8_t)(0x42),
+            (uint8_t)(0x42),
+        };
+        set_b(v);                                    // Publish B payload + set B-ready flag
+        k_sleep(K_MSEC(50));                         // Sleep a bit before next publish
+    }
+}
+
+/* ---------- Threads ---------- */
+K_THREAD_STACK_DEFINE(worker_stack, 1024);          // Stack for worker thread (TX serializer)
+K_THREAD_STACK_DEFINE(prod_a_stack, 768);           // Stack for A-producer thread
+K_THREAD_STACK_DEFINE(prod_b_stack, 768);           // Stack for B-producer thread
+static struct k_thread worker_tcb, prod_a_tcb, prod_b_tcb; // Thread control blocks (metadata)
+
+/* ---------- Main ---------- */
+int main(void) // Entry point (Zephyr apps still define main())
+{
+    if (!device_is_ready(uart_dev)) {               // Ensure UART device is probed and ready
+        LOG_ERR("UART not ready");                  // Log error if not
+        return 0;                                   // Exit main (thread ends)
+    }
+
+    /* Init flags/caches + sem */
+    atomic_clear(&ready_flags);                     // Clear all ready flags at startup
+    atomic_set(&a_cache, 0);                        // Initialize A cache to 0
+    atomic_set(&b_cache, 0);                        // Initialize B cache to 0
+    k_sem_init(&tx_done_sem, 0, 1);                 // Initialize TX completion semaphore (count=0, max=1)
+
+    /* UART async: set callback and enable RX (double-buffer) */
+    uart_callback_set(uart_dev, uart_cb, NULL);     // Register ISR callback for async UART events
+    rx_idx = 1;                                     // Next buffer to hand out will be index 1 (we start with 0)
+    int rc = uart_rx_enable(uart_dev,               // Enable async RX:
+                            rx_buf[0],              //  - initial buffer is rx_buf[0]
+                            RX_CHUNK_LEN,           //  - buffer size per chunk
+                            RX_IDLE_TIMEOUT_US);    //  - idle timeout to deliver UART_RX_RDY events
+    if (rc) {                                       // If enabling RX failed
+        LOG_ERR("uart_rx_enable failed (%d)", rc);  // Log the error code
+        return 0;                                   // Exit main
+    }
+
+    /* Start worker + producers */
+    k_thread_create(&worker_tcb, worker_stack, K_THREAD_STACK_SIZEOF(worker_stack),
+                    tx_worker, NULL, NULL, NULL,
+                    K_PRIO_PREEMPT(7), 0, K_NO_WAIT); // Start worker thread (higher prio than producers)
+    k_thread_create(&prod_a_tcb, prod_a_stack, K_THREAD_STACK_SIZEOF(prod_a_stack),
+                    producer_a, NULL, NULL, NULL,
+                    K_PRIO_PREEMPT(8), 0, K_NO_WAIT); // Start A-producer thread
+    k_thread_create(&prod_b_tcb, prod_b_stack, K_THREAD_STACK_SIZEOF(prod_b_stack),
+                    producer_b, NULL, NULL, NULL,
+                    K_PRIO_PREEMPT(8), 0, K_NO_WAIT); // Start B-producer thread
+
+    LOG_INF("Worker-thread TX: send 'A' or 'B' to get 4 bytes (flag-gated)."); // Informative startup log
+
+    while (1) {                                   // Keep main thread alive
+        k_sleep(K_FOREVER);                       // Park forever (all work is in other threads/ISR)
+    }
 }
