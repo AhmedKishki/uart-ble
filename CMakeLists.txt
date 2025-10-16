@@ -12,7 +12,9 @@ target_sources(app PRIVATE
   src/serial/serial_io.c
   src/proto/ab_payload.c
   src/proto/parser_worker.c
+  src/ble/ble_service.c
   src/workers/tx_worker.c
+  src/workers/bt_rx_worker.c
   src/producers/producer_a.c
   src/producers/producer_b.c
 )
@@ -22,6 +24,7 @@ target_include_directories(app PRIVATE
   src
   src/serial
   src/proto
+  src/ble
   src/workers
   src/producers
 )

@@ -14,7 +14,10 @@ and two example producers.
 
 It's split into clean modules so ISR logic, protocol parsing, and workers don't step on each other.
 
+
 Directory layout
+
+```
 app/
 ├─ CMakeLists.txt
 ├─ prj.conf
@@ -38,6 +41,7 @@ app/
       ├─ producers.h
       ├─ producer_a.c
       └─ producer_b.c
+```
 
 What it does (data flow)
 

@@ -10,3 +10,6 @@
 /* Periods for the producers */
 #define AB_PROD_A_PERIOD_MS 10
 #define AB_PROD_B_PERIOD_MS 50
+/* BLE queue element size and depth */
+#define BLE_RX_MAX      20
+#define BLE_RX_Q_DEPTH  8
