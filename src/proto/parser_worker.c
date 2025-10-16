@@ -7,9 +7,9 @@
 #include <zephyr/logging/log.h>
 
 #include "ipc.h"
-#include "proto/ab_payload.h"   /* for CMD_A / CMD_B */
+#include "proto/payload.h"   /* for CMD_A / CMD_B */
 
-LOG_MODULE_REGISTER(ab_parser, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(parser, LOG_LEVEL_INF);
 
 /* Thread control block owned here */
 static struct k_thread parser_tcb;
@@ -43,7 +43,7 @@ static void parser_thread(void *a, void *b, void *c)
             break;
 
         case GOT_S:
-            if (ch == CMD_A || ch == CMD_B) {
+            if (ch == CMD_A || ch == CMD_B || ch == CMD_C) {
                 (void)ipc_cmd_put(ch);  /* non-blocking; drops if full */
             }
             /* Regardless of what arrived, reset and look for next frame */

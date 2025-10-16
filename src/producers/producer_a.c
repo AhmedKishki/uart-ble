@@ -7,13 +7,13 @@
 #include <zephyr/logging/log.h>
 
 #include "config.h"
-#include "proto/ab_payload.h"
+#include "proto/payload.h"
 
-LOG_MODULE_REGISTER(ab_prod_a, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(prod_a, LOG_LEVEL_INF);
 
 /* Fallback period if not set in config.h */
-#ifndef AB_PROD_A_PERIOD_MS
-#define AB_PROD_A_PERIOD_MS 10
+#ifndef PROD_A_PERIOD_MS
+#define PROD_A_PERIOD_MS 10
 #endif
 
 /* Thread control block (owned here) */
@@ -27,9 +27,9 @@ static void default_fill_A(uint8_t out[4])
 {
     out[0] = 0x41; out[1] = 0x41; out[2] = 0x41; out[3] = 0x41; /* 'A' */
 }
-static ab_fill_fn_t fill_A = default_fill_A;
+static fill_fn_t fill_A = default_fill_A;
 
-void producer_a_set_fill(ab_fill_fn_t fn)
+void producer_a_set_fill(fill_fn_t fn)
 {
     fill_A = (fn != NULL) ? fn : default_fill_A;
 }
@@ -42,8 +42,8 @@ static void producer_a_thread(void *a, void *b, void *c)
 
     for (;;) {
         fill_A(v);         /* produce 4 bytes */
-        ab_set_A(v);       /* publish + set ready flag */
-        k_sleep(K_MSEC(AB_PROD_A_PERIOD_MS));
+        set_A(v);          /* publish + set ready flag */
+        k_sleep(K_MSEC(PROD_A_PERIOD_MS));
     }
 }
 

@@ -10,13 +10,12 @@ target_sources(app PRIVATE
   src/main.c
   src/ipc.c
   src/serial/serial_io.c
-  src/proto/ab_payload.c
+  src/proto/payload.c
   src/proto/parser_worker.c
-  src/ble/ble_service.c
   src/workers/tx_worker.c
-  src/workers/bt_rx_worker.c
   src/producers/producer_a.c
   src/producers/producer_b.c
+  src/ble/ble_service.c
 )
 
 # Public headers live in these folders

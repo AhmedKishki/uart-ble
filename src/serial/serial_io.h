@@ -15,7 +15,7 @@ extern "C" {
  * - enables double-buffered RX
  * Returns 0 on success, <0 on error.
  */
-int serial_io_init(void);
+void serial_io_init(void);
 
 /**
  * Start a TX (non-blocking). Returns:
