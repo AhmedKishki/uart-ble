@@ -1,59 +1,50 @@
-.. zephyr:code-sample:: uart_async
-   :name: UART ASYNC API
-   :relevant-api: uart_interface
+Async UART Worker (Zephyr / nRF Connect SDK)
 
-   Demonstrate the use of the asynchronous API
+A small, production-style skeleton that shows async UART RX/TX with:
 
-Overview
-********
+lock-free 4-byte payload caches,
 
-This sample demonstrates how to use the UART serial driver asynchronous
-API through a simple packet transmitter.
+an IPC layer (queues, semaphore, soft half-duplex flag),
 
-Every 5 seconds, 1 to 4 data payloads are generated and queued for
-transmission. Every other 5 second period, receiving is enabled through
-the asynchronous API.
+a parser thread (bytes → commands),
 
-By default, the UART peripheral that is normally used for the Zephyr shell
-is used, so that almost every board should be supported.
+a TX worker (serializes sends, handles -EBUSY),
 
-Building and Running
-********************
+and two example producers.
 
-Build and flash the sample as follows, changing ``nrf52840dk/nrf52840`` for
-your board:
+It's split into clean modules so ISR logic, protocol parsing, and workers don't step on each other.
 
-.. zephyr-app-commands::
-   :zephyr-app: samples/drivers/uart/async_api
-   :board: nrf52840dk/nrf52840
-   :goals: build flash
-   :compact:
+Directory layout
+app/
+├─ CMakeLists.txt
+├─ prj.conf
+└─ src/
+   ├─ main.c
+   ├─ config.h
+   ├─ ipc.c
+   ├─ ipc.h
+   ├─ serial/
+   │  ├─ serial_io.c
+   │  └─ serial_io.h
+   ├─ proto/
+   │  ├─ ab_payload.c
+   │  ├─ ab_payload.h
+   │  ├─ parser_worker.c
+   │  └─ parser_worker.h
+   ├─ workers/
+   │  ├─ tx_worker.c
+   │  └─ tx_worker.h
+   └─ producers/
+      ├─ producers.h
+      ├─ producer_a.c
+      └─ producer_b.c
 
-Sample Output
-=============
+What it does (data flow)
 
-.. code-block:: console
+Producers publish 4-byte values for A and B →
+ab_payload stores them atomically and raises a “ready” flag →
+Parser waits for serial frames of the form 'S' <cmd> (where <cmd> is 'A' or 'B') and enqueues the command →
+TX worker sees the command, snapshots the corresponding 4-byte payload, opens a soft half-duplex window (mutes RX echoes), starts UART TX (retrying on -EBUSY), waits for TX_DONE, clears the ready flag, and closes the window.
 
-   Loop 0: Packet: 0
-   Loop 0: Packet: 1
-   Loop 0: Packet: 2
-   [00:00:05.001,919] <inf> sample: Loop 0: Sending 3 packets
-   [00:00:05.002,008] <inf> sample: RX is now enabled
-   Loop 1: Packet: 0
-   [00:00:10.002,086] <inf> sample: Loop 1: Sending 1 packets
-   [00:00:10.002,138] <inf> sample: RX is now disabled
-   Loop 2: Packet: 0
-   Loop 2: Packet: 1
-   [00:00:15.002,215] <inf> sample: Loop 2: Sending 2 packets
-   [00:00:15.002,293] <inf> sample: RX is now enabled
-   [00:00:15.009,010] <inf> sample: RX_RDY
-                                 68 65 6c 6c 6f 0a                                |hello.
-   Loop 3: Packet: 0
-   Loop 3: Packet: 1
-   Loop 3: Packet: 2
-   [00:00:20.002,343] <inf> sample: Loop 3: Sending 3 packets
-   [00:00:20.002,424] <inf> sample: RX is now disabled
-
-Note that because the UART transmissions are triggered directly, they will
-appear in the serial logs **before** the ``LOG_INF`` message at the top of
-the loop, since log writes are typically deferred by several seconds
+serial_io owns the UART device, double-buffered async RX, and the ISR.
+ipc owns the RX/command queues, the TX-done semaphore, and the “TX active” flag used by both ISR and worker.
