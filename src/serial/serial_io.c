@@ -19,7 +19,7 @@
 #define RX_CHUNK_LEN         64
 #endif
 #ifndef RX_IDLE_TIMEOUT_US
-#define RX_IDLE_TIMEOUT_US   1000  /* 1 ms */
+#define RX_IDLE_TIMEOUT_US   20000  /* 20 ms */
 #endif
 
 LOG_MODULE_REGISTER(serial, LOG_LEVEL_INF);
@@ -37,68 +37,56 @@ static void uart_cb(const struct device *dev, struct uart_event *evt, void *user
     ARG_UNUSED(dev);
     ARG_UNUSED(user_data);
 
-    switch (evt->type) 
+    switch (evt->type) {
+    case UART_RX_BUF_REQUEST: 
     {
-        case UART_RX_BUF_REQUEST: 
+        /* Driver wants the next buffer to keep streaming without gaps */
+        uint8_t i = rx_idx;
+        int rc = uart_rx_buf_rsp(uart_dev, rx_buf[i], sizeof(rx_buf[0]));
+        if (rc == 0) {
+            rx_idx = i ^ 1; /* toggle to other buffer */
+        } 
+        else 
         {
-            /* Driver wants the next buffer to keep streaming without gaps */
-            uint8_t i = rx_idx;
-            int rc = uart_rx_buf_rsp(uart_dev, rx_buf[i], sizeof(rx_buf[0]));
-            if (rc == 0) {
-                rx_idx = i ^ 1; /* toggle to other buffer */
-            } 
-            else 
-            {
-                /* If this fails, RX may stall until next request; nothing else to do in ISR */
-                LOG_DBG("uart_rx_buf_rsp() failed: %d", rc);
-            }
+            /* If this fails, RX may stall until next request; nothing else to do in ISR */
+            LOG_DBG("uart_rx_buf_rsp() failed: %d", rc);
+        }
+        break;
+    }
+
+    case UART_RX_RDY: 
+    {
+        /* A slice of bytes became ready (due to idle timeout or buffer getting filled) */
+        const uint8_t *p = evt->data.rx.buf + evt->data.rx.offset;
+        size_t n = evt->data.rx.len;
+
+        /* Soft half-duplex: drop anything while TX window is open */
+        if (ipc_is_tx_active()) {
+            /* We intentionally do not log at INFO here to avoid log floods */
             break;
         }
 
-        case UART_RX_RDY: 
-        {
-            /* A slice of bytes became ready (due to idle timeout or buffer getting filled) */
-            const uint8_t *p = evt->data.rx.buf + evt->data.rx.offset;
-            size_t n = evt->data.rx.len;
-
-            /* Soft half-duplex: drop anything while TX window is open */
-            if (ipc_is_tx_active()) {
-                /* We intentionally do not log at INFO here to avoid log floods */
-                break;
-            }
-
-            for (size_t i = 0; i < n; i++) {
-                (void)ipc_rx_put(p[i]); /* non-blocking; OK to drop if queue is full */
-            }
-            break;
+        for (size_t i = 0; i < n; i++) {
+            (void)ipc_rx_put(p[i]); /* non-blocking; OK to drop if queue is full */
         }
+        break;
+    }
 
-        case UART_TX_DONE:
-            /* Wake the worker that’s waiting for completion */
-            ipc_tx_done_give_from_isr();
-            break;
+    case UART_TX_DONE:
+        /* Wake the worker that’s waiting for completion */
+        ipc_tx_done_give_from_isr();
+        break;
 
-        case UART_TX_ABORTED:
-            /* Also wake the worker so it can recover/retry */
-            ipc_tx_done_give_from_isr();
-            break;
+    case UART_TX_ABORTED:
+        /* Also wake the worker so it can recover/retry */
+        ipc_tx_done_give_from_isr();
+        break;
 
-        case UART_RX_STOPPED:
-            if (evt->data.rx_stop.reason == UART_BREAK)
-            {
-                LOG_WRN("UART RX stopped due to BREAK condition");
-                (void)ipc_rx_put(0x00); /* 0x00 indicates break */
-            } 
-            else 
-            {
-                LOG_WRN("UART RX stopped due to error: 0x%02x",
-                        evt->data.rx_stop.reason);
-            }
-            break;
-
-        case UART_RX_DISABLED:
-        default:
-            break;
+    /* Unused events in this app; keep ISR short */
+    case UART_RX_STOPPED:
+    case UART_RX_DISABLED:
+    default:
+        break;
     }
 }
 

@@ -18,17 +18,15 @@ static struct k_thread parser_tcb;
 
 /* Simple two-byte protocol: 'S' <cmd> where cmd ∈ {'A','B'} */
 enum parse_state {
-    Break = 0x00,
-    Sync  = 0x55,
-    Poll,
-    Reply
+    WAIT_S = 0,
+    GOT_S,
 };
 
 static void parser_thread(void *a, void *b, void *c)
 {
     ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
 
-    enum parse_state state = Break;
+    enum parse_state state = WAIT_S;
     uint8_t ch;
 
     for (;;) {
@@ -37,30 +35,20 @@ static void parser_thread(void *a, void *b, void *c)
             continue; /* defensive: should not happen with FOREVER */
         }
 
-        switch (state) 
-        {
-            case Break:
-                if (ch == 0x00) 
-                {
-                    state = Sync; /* got Break */
-                }
-                break;
-            
-            case Sync:
-                if (ch == 0x55) 
-                {
-                    state = Poll; /* got Sync */
-                } 
-                break;
+        switch (state) {
+        case WAIT_S:
+            if (ch == 'S') {
+                state = GOT_S;
+            }
+            break;
 
-            case Poll:
-                if (ch == CMD_A || ch == CMD_B || ch == CMD_C)
-                {
-                    (void)ipc_cmd_put(ch);  /* non-blocking; drops if full */
-                }
-                /* Regardless of what arrived, reset and look for next frame */
-                state = Reply;
-                break;
+        case GOT_S:
+            if (ch == CMD_A || ch == CMD_B || ch == CMD_C) {
+                (void)ipc_cmd_put(ch);  /* non-blocking; drops if full */
+            }
+            /* Regardless of what arrived, reset and look for next frame */
+            state = WAIT_S;
+            break;
         }
     }
 }
@@ -71,4 +59,8 @@ void parser_worker_start(k_thread_stack_t *stack, size_t stack_size, int priorit
         &parser_tcb, stack, stack_size,
         parser_thread, NULL, NULL, NULL,
         priority, 0, K_NO_WAIT);
+
+#if defined(CONFIG_THREAD_NAME)
+    k_thread_name_set(&parser_tcb, PARSER_THREAD_NAME);
+#endif
 }

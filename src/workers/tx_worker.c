@@ -14,6 +14,9 @@ LOG_MODULE_REGISTER(tx, LOG_LEVEL_INF);
 /* Thread control block (owned here) */
 static struct k_thread tx_tcb;
 
+/* Optional: name visible in thread analyzer */
+#define TX_THREAD_NAME "tx_worker"
+
 /* ---------------- Internal helpers ---------------- */
 
 static inline bool snapshot_payload(uint8_t cmd, uint8_t out[4])
@@ -99,4 +102,8 @@ void tx_worker_start(k_thread_stack_t *stack, size_t stack_size, int priority)
             &tx_tcb, stack, stack_size,
             tx_worker_thread, NULL, NULL, NULL,
             priority, 0, K_NO_WAIT);
+
+#if defined(CONFIG_THREAD_NAME)
+    k_thread_name_set(tid, TX_THREAD_NAME);
+#endif
 }

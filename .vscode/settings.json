@@ -1,5 +1,10 @@
 {
     "files.associations": {
-        "kernel.h": "c"
+        "uart.h": "c",
+        "string.h": "c",
+        "payload.h": "c",
+        "stdint.h": "c",
+        "serial_io.h": "c",
+        "config.h": "c"
     }
 }

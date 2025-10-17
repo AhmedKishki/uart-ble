@@ -53,4 +53,8 @@ void producer_a_start(k_thread_stack_t *stack, size_t stack_size, int priority)
         &prod_a_tcb, stack, stack_size,
         producer_a_thread, NULL, NULL, NULL,
         priority, 0, K_NO_WAIT);
+
+#if defined(CONFIG_THREAD_NAME)
+    k_thread_name_set(&prod_a_tcb, PROD_A_THREAD_NAME);
+#endif
 }
