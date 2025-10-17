@@ -7,7 +7,7 @@
 #include <zephyr/logging/log.h>
 
 #include "ipc.h"
-#include "proto/payload.h"   /* for CMD_A / CMD_B */
+#include "proto/payload.h"
 
 LOG_MODULE_REGISTER(parser, LOG_LEVEL_INF);
 
@@ -18,37 +18,65 @@ static struct k_thread parser_tcb;
 
 /* Simple two-byte protocol: 'S' <cmd> where cmd ∈ {'A','B'} */
 enum parse_state {
-    WAIT_S = 0,
-    GOT_S,
+    Break,
+    Sync,
+    Poll
 };
 
 static void parser_thread(void *a, void *b, void *c)
 {
     ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
 
-    enum parse_state state = WAIT_S;
-    uint8_t ch;
+    uint8_t v[4];
+    uint8_t idx = 0;
+    struct ipc_rx_msg msg;
+    enum parse_state state = Break;
 
     for (;;) {
         /* Block until a byte is available from ISR */
-        if (!ipc_rx_get(&ch, K_FOREVER)) {
-            continue; /* defensive: should not happen with FOREVER */
+        if (!ipc_rx_get_pair(&msg, K_FOREVER)) 
+        {
+            continue;
         }
 
-        switch (state) {
-        case WAIT_S:
-            if (ch == 'S') {
-                state = GOT_S;
-            }
-            break;
+        if (msg.evt == IPC_RX_EVT_BREAK)
+        {
+            idx = 0;
+            state = Break;
+            continue;
+        }
 
-        case GOT_S:
-            if (ch == CMD_A || ch == CMD_B || ch == CMD_C) {
-                (void)ipc_cmd_put(ch);  /* non-blocking; drops if full */
-            }
-            /* Regardless of what arrived, reset and look for next frame */
-            state = WAIT_S;
-            break;
+        switch (state) 
+        {
+            case Break:
+                if (msg.data == 'S') 
+                {
+                    state = Sync;
+                }
+                break;
+
+            case Sync:
+                if (msg.data == CMD_A || msg.data == CMD_B || msg.data == CMD_C) 
+                {
+                    (void)ipc_cmd_put(msg.data);
+                    state = Break;
+                }
+                else if (msg.data == CMD_D)
+                {
+                    state = Poll;
+                }
+                break;
+
+            case Poll:
+                LOG_INF("D received: 0x%02x", msg.data);
+                v[idx] = msg.data;
+                idx++;
+                if (idx >= 4)
+                {
+                    set_D(v);
+                    state = Break;
+                }
+                break;
         }
     }
 }
@@ -59,8 +87,4 @@ void parser_worker_start(k_thread_stack_t *stack, size_t stack_size, int priorit
         &parser_tcb, stack, stack_size,
         parser_thread, NULL, NULL, NULL,
         priority, 0, K_NO_WAIT);
-
-#if defined(CONFIG_THREAD_NAME)
-    k_thread_name_set(&parser_tcb, PARSER_THREAD_NAME);
-#endif
 }

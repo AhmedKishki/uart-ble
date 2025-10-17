@@ -44,8 +44,6 @@ static void tx_worker_thread(void *a, void *b, void *c)
             continue; /* should not happen with FOREVER, but be defensive */
         }
 
-        LOG_INF("tx_worker: unknown cmd 0x%02x", cmd);
-
         /* Only handle known commands */
         if (cmd != CMD_A && cmd != CMD_B && cmd != CMD_C) {
             LOG_DBG("tx_worker: unknown cmd 0x%02x", cmd);
@@ -102,8 +100,4 @@ void tx_worker_start(k_thread_stack_t *stack, size_t stack_size, int priority)
             &tx_tcb, stack, stack_size,
             tx_worker_thread, NULL, NULL, NULL,
             priority, 0, K_NO_WAIT);
-
-#if defined(CONFIG_THREAD_NAME)
-    k_thread_name_set(tid, TX_THREAD_NAME);
-#endif
 }

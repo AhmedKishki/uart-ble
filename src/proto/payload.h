@@ -14,11 +14,13 @@ extern "C" {
 #define CMD_A 'A'
 #define CMD_B 'B'
 #define CMD_C 'C'
+#define CMD_D 'D'
 
 /* Producers publish 4-byte payloads and set the corresponding "ready" flag */
 void set_A(const uint8_t v[4]);
 void set_B(const uint8_t v[4]);
 void set_C(const uint8_t v[4]);
+void set_D(const uint8_t v[4]);
 
 /* Query if a payload for CMD_A / CMD_B is ready (true = ready) */
 bool is_ready(uint8_t cmd);

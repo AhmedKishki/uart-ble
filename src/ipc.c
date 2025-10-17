@@ -3,19 +3,10 @@
 #include <zephyr/kernel.h>
 #include <zephyr/sys/atomic.h>
 
-/* Tunables (can be moved to config.h or Kconfig later) */
-#ifndef IPC_RX_Q_LEN
-#define IPC_RX_Q_LEN   64   /* bytes */
-#endif
-
-#ifndef IPC_CMD_Q_LEN
-#define IPC_CMD_Q_LEN   8   /* commands */
-#endif
-
 /* --------- Storage: kept private to this translation unit --------- */
 
-/* RX bytes coming from UART ISR to parser thread */
-K_MSGQ_DEFINE(ipc_rx_q, sizeof(uint8_t), IPC_RX_Q_LEN, 4);
+/* RX messages: each element is {evt, data} */
+K_MSGQ_DEFINE(ipc_rx_q, sizeof(struct ipc_rx_msg), IPC_RX_Q_LEN, 4);
 
 /* Commands from parser to TX worker */
 K_MSGQ_DEFINE(ipc_cmd_q, sizeof(uint8_t), IPC_CMD_Q_LEN, 4);
@@ -26,31 +17,28 @@ static struct k_sem tx_done_sem;
 /* Soft half-duplex flag (worker sets during TX; ISR checks to drop bytes) */
 static atomic_t tx_active;
 
-/* ------------------------------ API ------------------------------- */
-
 void ipc_init(void)
 {
-    /* Start with empty queues and TX inactive */
     k_msgq_purge(&ipc_rx_q);
     k_msgq_purge(&ipc_cmd_q);
     atomic_clear(&tx_active);
-
-    /* Worker must take before next give; cap 1 is enough */
     k_sem_init(&tx_done_sem, 0, 1);
 }
 
-/* ---- RX queue ---- */
+/* ---- RX queue (pair API) ---- */
 
-bool ipc_rx_put(uint8_t c)
+bool ipc_rx_put_pair(uint8_t evt, uint8_t data)
 {
-    /* Safe from ISR with K_NO_WAIT */
-    return k_msgq_put(&ipc_rx_q, &c, K_NO_WAIT) == 0;
+    struct ipc_rx_msg m = { .evt = evt, .data = data };
+    return k_msgq_put(&ipc_rx_q, &m, K_NO_WAIT) == 0;
 }
 
-bool ipc_rx_get(uint8_t *c, k_timeout_t to)
+bool ipc_rx_get_pair(struct ipc_rx_msg *m, k_timeout_t to)
 {
-    return k_msgq_get(&ipc_rx_q, c, to) == 0;
+    return k_msgq_get(&ipc_rx_q, m, to) == 0;
 }
+
+/* ---- RX purge ---- */
 
 void ipc_rx_purge(void)
 {
@@ -78,7 +66,6 @@ void ipc_cmd_purge(void)
 
 void ipc_tx_done_give_from_isr(void)
 {
-    /* k_sem_give is ISR-safe in Zephyr */
     k_sem_give(&tx_done_sem);
 }
 
